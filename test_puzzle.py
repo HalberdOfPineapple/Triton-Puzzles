@@ -25,6 +25,7 @@ def test(puzzle, puzzle_spec, nelem={}, B={"B0": 32}, print_log=False, device="c
 
     tt_args = []
     for k, (v, t) in args.items():
+        print(f"k={k} | v=({v}) | t={t}")
         tt_args.append(torch.rand(*v, device=device) - 0.5)
         # tt_args.append(torch.ones(*v, device=device))
         if t is not None and t.annotation.dtype == "int32":

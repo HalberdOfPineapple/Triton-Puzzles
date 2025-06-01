@@ -243,6 +243,12 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    block_idx = tl.program_id(0)
+    offs_x = block_idx * B0 + tl.arange(0, B0)
+    x = tl.load(x_ptr + offs_x, mask=offs_x < N0)
+    x = x + 10.0
+
+    tl.store(z_ptr + offs_x, x, mask=offs_x < N0)
     return
 
 
@@ -258,14 +264,20 @@ Block size `B1` is always the same as vector `y` length `N1`.
     z_{j, i} = x_i + y_j\text{ for } i = 1\ldots B_0,\ j = 1\ldots B_1
 """
 
-
 def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
     return x[None, :] + y[:, None]
 
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    offs_x = tl.arange(0, B0)
+    offs_y = tl.arange(0, B1)
+
+    x = tl.load(x_ptr + offs_x)
+    y = tl.load(y_ptr + offs_y)
+    z = x[None, :] + y[:, None]
+
+    tl.store(z_ptr + offs_x[None, :] + offs_y[:, None] * B1, z)
     return
 
 
@@ -274,7 +286,8 @@ r"""
 
 Add a row vector to a column vector.
 
-Uses two program block axes. Block size `B0` is always less than the vector `x` length `N0`.
+Uses two program block axes. 
+Block size `B0` is always less than the vector `x` length `N0`.
 Block size `B1` is always less than vector `y` length `N1`.
 
 .. math::
@@ -292,6 +305,17 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+
+    offs_x = block_id_x * B0 + tl.arange(0, B0)
+    offs_y = block_id_y * B1 + tl.arange(0, B1)
+    offs_z = offs_y[:, None] * N0 + offs_x[None, :]
+
+    x = tl.load(x_ptr + offs_x, mask=offs_x < N0)
+    y = tl.load(y_ptr + offs_y, mask=offs_y < N1)
+    z = x[None, :] + y[:, None]
+
+    tl.store(z_ptr + offs_z, z, mask=offs_x[None, :] < N0 and offs_y[:, None] < N1)
+
     # Finish me!
     return
 
@@ -319,7 +343,17 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+
+    offs_x = block_id_x * B0 + tl.arange(0, B0)
+    offs_y = block_id_y * B1 + tl.arange(0, B1)
+    offs_z = offs_y[:, None] * N0 + offs_x[None, :]
+
+    x = tl.load(x_ptr + offs_x, mask=offs_x < N0)
+    y = tl.load(y_ptr + offs_y, mask=offs_y < N1)
+    z = x[None, :] * y[:, None]
+    z = tl.where(z > 0, z, 0)
+
+    tl.store(z_ptr + offs_z, z, mask=offs_x[None, :] < N0 and offs_y[:, None] < N1)
     return
 
 
@@ -328,9 +362,10 @@ r"""
 
 Backwards of a function that multiplies a matrix with a row vector and take a relu.
 
-Uses two program blocks. Block size `B0` is always less than the vector `x` length `N0`.
-Block size `B1` is always less than vector `y` length `N1`. Chain rule backward `dz`
-is of shape `N1` by `N0`
+- Uses two program blocks. 
+- Block size `B0` is always less than the vector `x` length `N0`.
+- Block size `B1` is always less than vector `y` length `N1`. 
+- Chain rule backward `dz` is of shape `N1` by `N0`
 
 .. math::
     f(x, y) = \text{relu}(x_{j, i} \times y_j)\text{ for } i = 1\ldots N_0,\ j = 1\ldots N_1
@@ -341,7 +376,9 @@ is of shape `N1` by `N0`
 
 
 def mul_relu_block_back_spec(
-    x: Float32[90, 100], y: Float32[90,], dz: Float32[90, 100]
+    x: Float32[90, 100], 
+    y: Float32[90,], 
+    dz: Float32[90, 100]
 ) -> Float32[90, 100]:
     x = x.clone()
     y = y.clone()
@@ -355,11 +392,29 @@ def mul_relu_block_back_spec(
 
 @triton.jit
 def mul_relu_block_back_kernel(
-    x_ptr, y_ptr, dz_ptr, dx_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
+    x_ptr, y_ptr, 
+    dz_ptr, dx_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
 ):
-    block_id_i = tl.program_id(0)
-    block_id_j = tl.program_id(1)
-    # Finish me!
+    block_idx_i = tl.program_id(0)
+    block_idx_j = tl.program_id(1)
+
+    offs_i = block_idx_i * B0 + tl.arange(0, B0)
+    offs_j = block_idx_j * B1 + tl.arange(0, B1)
+    offs_ij = offs_i[:, None] * N1 + offs_j[None, :]
+    mask_ij = (offs_i < N0)[:, None] & (offs_j < N1)[None, :]
+
+    x = tl.load(x_ptr + offs_ij, mask=mask_ij)
+    dz = tl.load(dz_ptr + offs_ij, mask=mask_ij)
+
+    y = tl.load(y_ptr + offs_i, mask=offs_i < N0)
+    
+    z = x * y[:, None]
+    z = tl.where(z > 0, z, 0)
+
+    dzx = tl.where(z > 0, y[:, None], 0)
+    dx = dz * dzx
+
+    tl.store(dx_ptr + offs_ij, dx, mask=mask_ij)
     return
 
 
@@ -699,7 +754,8 @@ def run_puzzles(args, puzzles: List[int]):
         ok = test(
             mul_relu_block_back_kernel,
             mul_relu_block_back_spec,
-            nelem={"N0": 100, "N1": 90},
+            # nelem={"N0": 100, "N1": 90},
+            nelem={"N1": 100, "N0": 90},
             print_log=print_log,
             device=device,
         )
