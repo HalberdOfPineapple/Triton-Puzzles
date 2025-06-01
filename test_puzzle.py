@@ -40,7 +40,7 @@ def test(puzzle, puzzle_spec, nelem={}, B={"B0": 32}, print_log=False, device="c
     # triton_viz.trace(puzzle)[grid](*tt_args, **B, **nelem))
     with patch():
         puzzle[grid](*tt_args, **B, **nelem)
-    
+
     z = tt_args[-1]
     tt_args = tt_args[:-1]
     z_ = puzzle_spec(*tt_args)
