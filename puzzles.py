@@ -406,6 +406,7 @@ def mul_relu_block_back_kernel(
     x = tl.load(x_ptr + offs_ij, mask=mask_ij)
     dz = tl.load(dz_ptr + offs_ij, mask=mask_ij)
 
+    # Note that y is a vector of size N0 so we need to use offs_i and N0 instead of j/N1
     y = tl.load(y_ptr + offs_i, mask=offs_i < N0)
     
     z = x * y[:, None]
@@ -436,10 +437,22 @@ Hint: You will need a for loop for this problem. These work and look the same as
 def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
     return x.sum(1)
 
-
+# B={"B0": 1, "B1": 32},
+# nelem={"N0": 4, "N1": 32, "T": 200},
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    # N1 here is useless -> T is the real N1
+
+    block_id_i = tl.program_id(0)
+    num_blocks = tl.cdiv(T, B1)
+    sum = 0.
+
+    for block_id_j in tl.range(num_blocks):
+        x_block_ptr = x_ptr + block_id_i * T + block_id_j * B1 + tl.arange(0, B1)
+        x_block_vals = tl.load(x_block_ptr, mask=block_id_j * B1 + tl.arange(0, B1) < T, other=0.0)
+        sum += tl.sum(x_block_vals)
+
+    tl.store(z_ptr + block_id_i, sum)
     return
 
 
@@ -474,24 +487,38 @@ def softmax_spec(x: Float32[4, 200]) -> Float32[4, 200]:
     x_exp = x.exp()
     return x_exp / x_exp.sum(1, keepdim=True)
 
-
+# e^x = e ^ (ln2 * (x / ln2)) = 2 ^ (x / ln2) = 2 ^ (log2e * x)
+# B={"B0": 1, "B1": 32},
+# nelem={"N0": 4, "N1": 32, "T": 200},
 @triton.jit
 def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     """2 loops ver."""
     block_id_i = tl.program_id(0)
-    log2_e = 1.44269504
-    # Finish me!
-    return
+    if block_id_i >= N0: return
 
-
-@triton.jit
-def softmax_kernel_brute_force(
-    x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr
-):
-    """3 loops ver."""
-    block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+    max_val = 0.0 - float("inf")
+    exp_sum = 0.
+    num_blocks = tl.cdiv(T, B1)
+    for block_id_j in tl.range(0, num_blocks):
+        offset = block_id_i * T + block_id_j * B1 + tl.arange(0, B1)
+        x_block_ptr = x_ptr + offset
+        x_block_val = tl.load(x_block_ptr, mask=block_id_j * B1 + tl.arange(0, B1) < T, other=0.0) * log2_e
+        
+        max_val_new = tl.maximum(max_val, tl.max(x_block_val))
+        alpha = tl.math.exp2(max_val - max_val_new)
+
+        exp_sum = exp_sum * alpha + tl.sum(tl.exp2((x_block_val - max_val_new)))
+        max_val = max_val_new
+    
+    for block_id_j in tl.range(0, num_blocks):
+        offset = block_id_i * T + block_id_j * B1 + tl.arange(0, B1)
+        x_block_ptr = x_ptr + offset
+        x_block_val = tl.load(x_block_ptr, mask=block_id_j * B1 + tl.arange(0, B1) < T, other=0.0) * log2_e
+
+        softmax_val = tl.math.exp2(x_block_val - max_val) / exp_sum
+        tl.store(z_ptr + offset, softmax_val, mask=block_id_j * B1 + tl.arange(0, B1) < T)
+
     return
 
 
@@ -522,14 +549,47 @@ def flashatt_spec(
     return (v[None, :] * soft).sum(1)
 
 
+# B={"B0": 64, "B1": 32},
+# nelem={"N0": 200, "T": 200},
 @triton.jit
 def flashatt_kernel(
-    q_ptr, k_ptr, v_ptr, z_ptr, N0, T, B0: tl.constexpr, B1: tl.constexpr
+    q_ptr, k_ptr, 
+    v_ptr, z_ptr, 
+    N0, T, 
+    B0: tl.constexpr, B1: tl.constexpr
 ):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    myexp = lambda x: tl.exp2(log2_e * x)
-    # Finish me!
+    num_block_j = tl.cdiv(T, B1)
+    
+    off_i = block_id_i * B0 + tl.arange(0, B0)
+    q_block_ptr = q_ptr + off_i
+    q = tl.load(q_block_ptr, mask=off_i < N0, other=0.0) * log2_e
+
+    max_val = tl.zeros([B0], dtype=tl.float32) - float('inf')
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    acc = tl.zeros([B0], tl.float32)
+    for block_id_j in range(0, num_block_j):
+        block_off = block_id_j * B1 + tl.arange(0, B1)
+
+        k = tl.load(k_ptr + block_off, mask=block_off < T)
+        v = tl.load(v_ptr + block_off, mask=block_off < T)
+
+        # Note this is scalar verion. We can only use outer product for matmul
+        qk = q[:, None] * k[None, :]
+        qk = tl.where((off_i[:, None] < N0) & (block_off[None, :] < T), qk, -float('inf'))
+
+        max_val_new = tl.maximum(max_val, tl.max(qk, axis=1))
+        alpha = tl.math.exp2(max_val - max_val_new)
+        p = tl.math.exp2(qk - max_val_new[:, None])
+        
+        acc = acc * alpha + tl.sum(p * v[None, :], axis=1)
+        exp_sum = exp_sum * alpha + tl.sum(p, axis=1)
+        max_val = max_val_new
+
+    acc = acc / exp_sum
+    tl.store(z_ptr + off_i, acc, mask=off_i < N0)
+
     return
 
 
@@ -556,10 +616,13 @@ def conv2d_spec(x: Float32[4, 8, 8], k: Float32[4, 4]) -> Float32[4, 8, 8]:
             z[:, i, j] = (k[None, :, :] * x[:, i : i + 4, j : j + 4]).sum(1).sum(1)
     return z
 
-
+# B={"B0": 1},
+# nelem={"N0": 4, "H": 8, "W": 8, "KH": 4, "KW": 4},
 @triton.jit
 def conv2d_kernel(
-    x_ptr, k_ptr, z_ptr, N0, H, W, KH: tl.constexpr, KW: tl.constexpr, B0: tl.constexpr
+    x_ptr, k_ptr, z_ptr, 
+    N0, H, W, 
+    KH: tl.constexpr, KW: tl.constexpr, B0: tl.constexpr
 ):
     block_id_i = tl.program_id(0)
     # Finish me!
@@ -590,7 +653,8 @@ Hint: the main trick is that you can split a matmul into smaller parts.
 def dot_spec(x: Float32[4, 32, 32], y: Float32[4, 32, 32]) -> Float32[4, 32, 32]:
     return x @ y
 
-
+# B={"B0": 16, "B1": 16, "B2": 1, "B_MID": 16},
+# nelem={"N0": 32, "N1": 32, "N2": 4, "MID": 32},
 @triton.jit
 def dot_kernel(
     x_ptr,
@@ -605,10 +669,35 @@ def dot_kernel(
     B2: tl.constexpr,
     B_MID: tl.constexpr,
 ):
-    block_id_j = tl.program_id(0)
-    block_id_k = tl.program_id(1)
-    block_id_i = tl.program_id(2)
-    # Finish me!
+    block_id_i = tl.program_id(0)
+    block_id_j = tl.program_id(1)
+    block_id_bsz = tl.program_id(2)
+
+    x_ptr = x_ptr + block_id_bsz * N0 * MID
+    y_ptr = y_ptr + block_id_bsz * MID * N1
+    z_ptr = z_ptr + block_id_bsz * N0 * N1
+
+    off_x_i = block_id_i * B0 + tl.arange(0, B0)
+    off_y_j = block_id_j * B1 + tl.arange(0, B1)
+    off_z_ij = off_x_i[:, None] * N1 + off_y_j[None, :]
+
+    acc = tl.zeros([B0, B1], dtype=x_ptr.type.element_ty)
+    num_mid_blocks = tl.cdiv(MID, B_MID)
+    for block_id_mid in tl.range(0, num_mid_blocks):
+        off_mid = block_id_mid * B_MID + tl.arange(0, B_MID)
+        
+        x_block = tl.load(
+            x_ptr + off_x_i[:, None] * MID + off_mid[None, :], 
+            mask=(off_x_i[:, None] < N0) & (off_mid[None, :] < MID)
+        )
+        y_block = tl.load(
+            y_ptr + off_mid[:, None] * N1 + off_y_j[None, :],
+            mask=(off_y_j[None, :] < N1) & (off_mid[None, :] < MID)
+        )
+        xy = tl.dot(x_block, y_block)
+        acc = acc + xy
+    
+    tl.store(z_ptr + off_z_ij, acc, mask=(off_x_i[:, None] < N0) & (off_y_j[None, :] < N1))
     return
 
 
@@ -647,17 +736,24 @@ def quant_dot_spec(
     offset = offset.view(32, 1)
 
     def extract(x):
+        # x - (d, )
+        # output - (d, 8)
         over = torch.arange(8) * 4
         mask = 2**4 - 1
         return (x[..., None] >> over) & mask
 
     scale = scale[..., None].expand(-1, 8, GROUP).contiguous().view(-1, 64)
+    print(f"scale shape: {scale.shape}")
+
+    # (32, 64)
     offset = (
         extract(offset)[..., None].expand(-1, 1, 8, GROUP).contiguous().view(-1, 64)
     )
+    print(f"offset shape: {offset.shape}")
     return (scale * (extract(weight).view(-1, 64) - offset)) @ activation
 
-
+# B={"B0": 16, "B1": 16, "B_MID": 64},
+# nelem={"N0": 32, "N1": 32, "MID": 64},
 @triton.jit
 def quant_dot_kernel(
     scale_ptr,
@@ -674,7 +770,9 @@ def quant_dot_kernel(
 ):
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
-    # Finish me!
+    
+
+
     return
 
 
